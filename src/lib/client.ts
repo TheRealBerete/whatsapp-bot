@@ -8,6 +8,7 @@ import makeWASocket, {
   type AnyMessageContent,
 } from "@whiskeysockets/baileys";
 import fs from "fs";
+import path from "path";
 import { config } from "../config";
 import { baileysLogger } from "./logger";
 import { recallMessage, rememberMessage } from "./msg-store";
@@ -134,6 +135,28 @@ function teardown(old: WASocket | null): void {
  * si scanner le QR ne suffit pas, c'est un vrai problème (numéro banni, device
  * retiré côté téléphone en boucle, horloge serveur fausse…).
  */
+/**
+ * Vide le CONTENU du dossier de session — surtout pas le dossier lui-même : en
+ * prod c'est un point de montage de volume Docker, `rmdir` dessus renvoie
+ * `EBUSY: resource busy or locked`. On supprime chaque entrée à l'intérieur.
+ */
+function wipeSessionFiles(): boolean {
+  try {
+    const dir = config.sessionDir;
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+      return true;
+    }
+    for (const entry of fs.readdirSync(dir)) {
+      fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+    }
+    return true;
+  } catch (e) {
+    console.error("Effacement session échoué :", (e as Error).message ?? e);
+    return false;
+  }
+}
+
 function resetSessionAndRepair(cause: string): void {
   authResetCount += 1;
   if (authResetCount > MAX_AUTH_RESETS) {
@@ -150,11 +173,16 @@ function resetSessionAndRepair(cause: string): void {
   }
 
   console.warn(`♻️  Session effacée (${cause}) — nouvel appairage QR (tentative ${authResetCount}/${MAX_AUTH_RESETS}).`);
-  try {
-    fs.rmSync(config.sessionDir, { recursive: true, force: true });
-    fs.mkdirSync(config.sessionDir, { recursive: true });
-  } catch (e) {
-    console.error("Effacement session échoué :", (e as Error).message ?? e);
+  // on coupe l'ancien socket AVANT d'effacer : sinon un `creds.update` tardif
+  // pourrait ré-écrire creds.json juste après le nettoyage
+  teardown(sock);
+  sock = null;
+  if (!wipeSessionFiles()) {
+    stopped = true;
+    void notifyOwner(
+      `⛔ *${config.botName}* : impossible d'effacer la session (${cause}). Intervention manuelle requise.`
+    );
+    return;
   }
   void notifyOwner(
     `♻️ *${config.botName}* : session invalide (${cause}). ` +
