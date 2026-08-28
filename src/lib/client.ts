@@ -7,10 +7,11 @@ import makeWASocket, {
   type ConnectionState,
   type AnyMessageContent,
 } from "@whiskeysockets/baileys";
-import qrcode from "qrcode-terminal";
+import fs from "fs";
 import { config } from "../config";
 import { baileysLogger } from "./logger";
 import { recallMessage, rememberMessage } from "./msg-store";
+import { announceQr, resetQrThrottle } from "./qr";
 
 export interface StartOptions {
   setup?: (sock: WASocket) => void;
@@ -28,11 +29,23 @@ let stopped = false; // arrêt volontaire : on ne se reconnecte plus
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let attempt = 0; // compteur pour le backoff exponentiel
 let everOnline = false;
+let badSessionStreak = 0; // erreurs de flux "500" consécutives sans reconnexion réussie
+let authResetCount = 0; // nb de sessions effacées automatiquement depuis le démarrage
 
 let ownerJids: string[] = [];
 
 const MAX_BACKOFF_MS = 60_000;
 const BASE_BACKOFF_MS = 1_000;
+// au-delà : on prévient le propriétaire (mais on continue d'essayer) — la
+// session est peut-être vraiment corrompue et demande un ré-appairage manuel
+const BAD_SESSION_ALERT_AT = 8;
+// et si ça ne revient toujours pas : on considère la session vraiment cassée
+// et on déclenche un ré-appairage QR automatique.
+const BAD_SESSION_REPAIR_AT = 20;
+// nb max de ré-appairages automatiques (effacement session + nouveau QR) avant
+// d'abandonner : si on scanne le QR et que WhatsApp re-déconnecte aussitôt,
+// insister ne sert à rien et risque de faire flag le numéro.
+const MAX_AUTH_RESETS = 3;
 
 /* ------------------------------------------------------------------ */
 /*  Helpers                                                            */
@@ -112,6 +125,44 @@ function teardown(old: WASocket | null): void {
   }
 }
 
+/**
+ * Efface la session sur disque puis programme une reconnexion : au prochain
+ * `connect()`, Baileys n'a plus de credentials → il émet un `qr` → `announceQr`
+ * l'envoie sur Telegram. Ré-appairage 100 % automatique, sans SSH.
+ *
+ * Garde-fou : au-delà de MAX_AUTH_RESETS effacements, on arrête et on alerte —
+ * si scanner le QR ne suffit pas, c'est un vrai problème (numéro banni, device
+ * retiré côté téléphone en boucle, horloge serveur fausse…).
+ */
+function resetSessionAndRepair(cause: string): void {
+  authResetCount += 1;
+  if (authResetCount > MAX_AUTH_RESETS) {
+    stopped = true;
+    console.error(
+      `⛔ ${authResetCount - 1} ré-appairages automatiques n'ont pas tenu (${cause}). Arrêt.\n` +
+        "   Intervention manuelle nécessaire (numéro, horloge serveur, device côté téléphone)."
+    );
+    void notifyOwner(
+      `⛔ *${config.botName}* : le ré-appairage automatique échoue en boucle (${cause}). ` +
+        "Bot arrêté, il faut regarder de près."
+    );
+    return;
+  }
+
+  console.warn(`♻️  Session effacée (${cause}) — nouvel appairage QR (tentative ${authResetCount}/${MAX_AUTH_RESETS}).`);
+  try {
+    fs.rmSync(config.sessionDir, { recursive: true, force: true });
+    fs.mkdirSync(config.sessionDir, { recursive: true });
+  } catch (e) {
+    console.error("Effacement session échoué :", (e as Error).message ?? e);
+  }
+  void notifyOwner(
+    `♻️ *${config.botName}* : session invalide (${cause}). ` +
+      "Je génère un nouveau QR, tu vas le recevoir ici — scanne-le depuis WhatsApp."
+  );
+  scheduleReconnect(2_000);
+}
+
 /* ------------------------------------------------------------------ */
 /*  Cycle de connexion                                                 */
 /* ------------------------------------------------------------------ */
@@ -123,14 +174,9 @@ async function handleClose(state: Partial<ConnectionState>): Promise<void> {
 
   switch (code) {
     case DisconnectReason.loggedOut: // 401
-      stopped = true;
-      console.error(
-        "⛔ WhatsApp a déconnecté cette session (logged out).\n" +
-          "   Un ré-appairage est nécessaire : `npm run pair`."
-      );
-      void notifyOwner(
-        `⛔ *${config.botName}* déconnecté par WhatsApp (logged out). Ré-appairage requis.`
-      );
+      // WhatsApp a invalidé la session (device retiré, purge serveur…). Les
+      // credentials sont mortes : on efface et on relance un appairage QR.
+      resetSessionAndRepair("logged out");
       return;
 
     case DisconnectReason.connectionReplaced: // 440
@@ -145,19 +191,30 @@ async function handleClose(state: Partial<ConnectionState>): Promise<void> {
       );
       return;
 
-    case DisconnectReason.badSession: // 500
-      stopped = true;
-      console.error(
-        "⛔ Session corrompue (badSession). Nettoie et ré-appaire :\n" +
-          "   rm -rf session session-pair && npm run pair"
-      );
-      void notifyOwner(`⛔ *${config.botName}* : session corrompue. Ré-appairage requis.`);
+    case DisconnectReason.badSession: {
+      // 500 = code par défaut de Baileys pour TOUT `<stream:error>` sans code
+      // explicite (cf. getErrorCodeFromStreamError). C'est presque toujours
+      // transitoire (hiccup serveur WA, migration de shard, coupure réseau) :
+      // on se reconnecte au lieu de tuer le bot. On n'alerte qu'après plusieurs
+      // échecs d'affilée sans jamais réussir à revenir en ligne.
+      badSessionStreak += 1;
+      if (badSessionStreak === BAD_SESSION_ALERT_AT) {
+        console.error(`⚠️  ${badSessionStreak} erreurs de flux consécutives — le bot continue d'essayer.`);
+        void notifyOwner(
+          `⚠️ *${config.botName}* : ${badSessionStreak} erreurs de flux d'affilée. Reconnexion en cours…`
+        );
+      }
+      if (badSessionStreak >= BAD_SESSION_REPAIR_AT) {
+        badSessionStreak = 0;
+        resetSessionAndRepair("erreurs de flux persistantes");
+        return;
+      }
+      scheduleReconnect(backoffDelay());
       return;
+    }
 
     case DisconnectReason.multideviceMismatch: // 411
-      stopped = true;
-      console.error("⛔ Incohérence multi-appareils. Ré-appairage nécessaire : `npm run pair`.");
-      void notifyOwner(`⛔ *${config.botName}* : incohérence multi-appareils. Ré-appairage requis.`);
+      resetSessionAndRepair("incohérence multi-appareils");
       return;
 
     case DisconnectReason.restartRequired: // 515
@@ -181,6 +238,9 @@ function handleOpen(): void {
   const wasReconnect = everOnline;
   everOnline = true;
   attempt = 0; // reset du backoff : on est revenu
+  badSessionStreak = 0; // on a réussi à revenir → les erreurs de flux étaient bien transitoires
+  authResetCount = 0; // l'appairage a tenu → on réautorise de futurs ré-appairages auto
+  resetQrThrottle(); // prêt à renvoyer un QR sur Telegram si besoin plus tard
 
   ownerJids = config.ownerNumbers.map((n) => `${n.replace(/\D/g, "")}@s.whatsapp.net`);
   console.log(`\n✅ CONNECTÉ — ${config.botName} est en ligne.`);
@@ -195,12 +255,7 @@ function handleOpen(): void {
 async function handleConnectionUpdate(update: Partial<ConnectionState>): Promise<void> {
   const { connection, qr } = update;
 
-  if (qr) {
-    console.log(
-      "\n📱 Scanne ce QR code avec WhatsApp (Appareils liés → Lier un appareil) :\n"
-    );
-    qrcode.generate(qr, { small: true });
-  }
+  if (qr) announceQr(qr);
 
   if (connection === "connecting") console.log("… connexion à WhatsApp");
   if (connection === "open") handleOpen();
@@ -238,7 +293,11 @@ async function connect(): Promise<WASocket> {
     // des médias view-once vers l'appareil lié
     markOnlineOnConnect: false,
     syncFullHistory: false,
-    generateHighQualityLinkPreview: true,
+    // false : ne PAS aller chercher les URLs reçues pour fabriquer un aperçu
+    // riche. Économise des requêtes sortantes (surface SSRF : le serveur du bot
+    // ferait des GET vers des URLs choisies par l'expéditeur), du réseau et du
+    // bruit dans les logs ("url generation failed").
+    generateHighQualityLinkPreview: false,
     connectTimeoutMs: 60_000,
     defaultQueryTimeoutMs: 60_000,
     // ping plus fréquent (défaut 30s) → détection plus rapide d'une
