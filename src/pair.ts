@@ -6,6 +6,7 @@ import makeWASocket, {
   DisconnectReason,
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
+import QRCode from "qrcode";
 import { config } from "./config";
 import { baileysLogger } from "./lib/logger";
 
@@ -84,6 +85,10 @@ async function main(): Promise<void> {
       if (qr) {
         console.log("\n📱 Scanne ce QR code :\n");
         qrcode.generate(qr, { small: true });
+        // Repli : si le terminal coupe le QR (extrémités hors écran), on écrit
+        // aussi un PNG net et zoomable, scannable directement depuis l'écran.
+        await QRCode.toFile("./qr.png", qr, { width: 512, margin: 2 }).catch(() => {});
+        console.log("\n🖼️  QR également enregistré → ./qr.png (ouvre-le si le terminal le tronque)\n");
       }
 
       if (connection === "open" && !finalized) {

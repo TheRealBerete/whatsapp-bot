@@ -11,6 +11,7 @@ data/
 tmp/
 *.log
 .nexus.lock
+qr.png
 
 # venv Python éventuel
 venv/
